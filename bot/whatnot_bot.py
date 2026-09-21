@@ -41,6 +41,10 @@ class WhatnotBot:
         self.status_callback = status_callback or print
         self.logged_in = False
         self.visited_streams = set()
+        # Signatures of giveaways already entered (or attempted) in the current
+        # stream. Prevents the bot from re-clicking the same giveaway box over
+        # and over. Reset whenever we enter a new stream.
+        self.entered_giveaways = set()
 
     def log(self, message: str):
         """Log a message using the status callback."""
@@ -624,6 +628,9 @@ class WhatnotBot:
 
     def enter_stream(self, stream: Dict[str, Any]):
         """Navigate to and enter a stream."""
+        # New stream => forget which giveaways we entered in the previous one,
+        # otherwise a generic "Giveaway" signature could wrongly be skipped here.
+        self.entered_giveaways.clear()
         try:
             stream_url = stream.get("url")
             if stream_url:
@@ -643,104 +650,172 @@ class WhatnotBot:
             self.log(f"Error entering stream: {str(e)}")
 
     def detect_giveaway(self) -> Optional[Dict[str, Any]]:
-        """Detect if there's an active giveaway in the current stream."""
+        """Detect an active giveaway box in the current stream.
+
+        Returns the clickable giveaway "box" (the card/pill that opens the
+        giveaway panel), skipping any giveaway that is already entered or that
+        we have already entered/attempted this stream. The actual "Enter
+        Giveaway" button is clicked later by ``enter_giveaway`` once the box has
+        been opened.
+        """
         try:
-            # Common giveaway button/element selectors for Whatnot
-            giveaway_selectors = [
-                # Direct giveaway buttons
-                "button[data-testid*='giveaway']",
+            candidates = []
+
+            # The giveaway box is usually tagged with a giveaway-specific test
+            # id / class / aria-label.
+            box_selectors = [
+                "[data-testid*='giveaway' i]",
                 "button[class*='giveaway' i]",
-                "button[class*='Giveaway']",
-                "[data-testid='enter-giveaway-button']",
-                "[class*='GiveawayEntry']",
-                "[class*='giveaway-entry']",
-                # Enter buttons that might be giveaways
-                "button:contains('Enter')",
-                "button[aria-label*='enter giveaway' i]",
-                "button[aria-label*='Enter Giveaway']",
-                # Modal or overlay giveaway elements
-                "[class*='GiveawayModal']",
-                "[class*='giveaway-modal']",
-                "[role='dialog'] button[class*='enter' i]",
+                "[class*='Giveaway']",
+                "[class*='giveaway' i]",
+                "[aria-label*='giveaway' i]",
             ]
-
-            # Also look for text-based indicators
-            page_source = self.driver.page_source.lower()
-            giveaway_active = any(indicator in page_source for indicator in [
-                "enter giveaway", "giveaway entry", "free giveaway",
-                "join giveaway", "click to enter"
-            ])
-
-            for selector in giveaway_selectors:
+            for selector in box_selectors:
                 try:
-                    if ":contains" in selector:
-                        # Use XPath for text-based selection
-                        elements = self.driver.find_elements(
-                            By.XPATH, "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'enter')]"
-                        )
-                    else:
-                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-
-                    for element in elements:
-                        if element.is_displayed() and element.is_enabled():
-                            # Check if it looks like a giveaway button
-                            text = element.text.lower()
-                            if any(kw in text for kw in ["enter", "join", "giveaway", "free"]):
-                                return {
-                                    "element": element,
-                                    "title": element.text or "Giveaway",
-                                    "selector": selector
-                                }
-                except (NoSuchElementException, StaleElementReferenceException):
+                    candidates.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
+                except Exception:
                     continue
 
-            # Look for giveaway section in the page
+            # Fall back to any element that mentions a giveaway by its text.
             try:
-                giveaway_sections = self.driver.find_elements(
-                    By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'giveaway')]"
-                )
-                for section in giveaway_sections:
-                    # Find clickable button nearby
-                    try:
-                        button = section.find_element(By.XPATH, ".//button | ./following-sibling::button | ./ancestor::div//button")
-                        if button.is_displayed() and button.is_enabled():
-                            return {
-                                "element": button,
-                                "title": section.text[:30] if section.text else "Giveaway",
-                                "selector": "giveaway-section"
-                            }
-                    except NoSuchElementException:
-                        continue
+                candidates.extend(self.driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(translate(text(), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                    "'giveaway')]"
+                ))
             except Exception:
                 pass
+
+            for element in candidates:
+                try:
+                    if not (element.is_displayed() and element.is_enabled()):
+                        continue
+
+                    text = (element.text or "").strip()
+                    if "giveaway" not in text.lower():
+                        continue
+
+                    # Skip giveaways that already show an entered/finished state.
+                    if self._is_giveaway_entered(element):
+                        continue
+
+                    # Skip giveaways we already entered/attempted this stream.
+                    signature = self._giveaway_signature(element, text)
+                    if signature in self.entered_giveaways:
+                        continue
+
+                    target = self._resolve_clickable(element)
+                    return {
+                        "element": target,
+                        "title": text[:50] or "Giveaway",
+                        "signature": signature,
+                    }
+                except StaleElementReferenceException:
+                    continue
 
         except Exception as e:
             self.log(f"Error detecting giveaway: {str(e)}")
 
         return None
 
-    def enter_giveaway(self, giveaway: Dict[str, Any]) -> bool:
-        """Enter the detected giveaway."""
+    def _resolve_clickable(self, element):
+        """Return the best clickable node for a detected giveaway element.
+
+        Prefer an enclosing ``<button>``/``role=button`` when the matched
+        element is only a text node inside one; otherwise use the element as-is
+        (many Whatnot cards are clickable ``<div>``s).
+        """
         try:
-            element = giveaway.get("element")
-            if not element:
+            clickable = element.find_element(
+                By.XPATH,
+                "ancestor-or-self::*[self::button or @role='button'][1]"
+            )
+            if clickable.is_displayed() and clickable.is_enabled():
+                return clickable
+        except (NoSuchElementException, StaleElementReferenceException):
+            pass
+        except Exception:
+            pass
+        return element
+
+    def _giveaway_signature(self, element, text: str) -> str:
+        """Build a stable-ish signature used to de-duplicate giveaways.
+
+        Prefers a stable DOM attribute; falls back to the giveaway text with
+        volatile numbers (entrant counts, timers) stripped out so the same
+        giveaway keeps the same signature across re-scans.
+        """
+        try:
+            for attr in ("data-giveaway-id", "data-testid", "id"):
+                value = element.get_attribute(attr)
+                if value:
+                    return f"{attr}:{value}"
+        except Exception:
+            pass
+        return "text:" + re.sub(r"\d+", "", text).strip().lower()
+
+    def _is_giveaway_entered(self, element) -> bool:
+        """Return True if a giveaway element shows an already-entered state."""
+        try:
+            text = (element.text or "").lower()
+            entered_keywords = [
+                "entered", "you're in", "youre in", "you are in",
+                "joined", "waiting for winner", "in this giveaway",
+            ]
+            if any(kw in text for kw in entered_keywords):
+                return True
+
+            if (element.get_attribute("aria-pressed") or "").lower() == "true":
+                return True
+
+            if element.get_attribute("disabled") is not None:
+                return True
+        except StaleElementReferenceException:
+            return False
+        except Exception:
+            return False
+        return False
+
+    def enter_giveaway(self, giveaway: Dict[str, Any]) -> bool:
+        """Enter the detected giveaway.
+
+        Entering a Whatnot giveaway is a two-step interaction:
+          1. Click the giveaway box to open the giveaway panel.
+          2. Click the "Enter Giveaway" button inside that panel.
+        """
+        try:
+            box = giveaway.get("element")
+            if not box:
                 return False
 
-            # Scroll element into view
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
-            time.sleep(0.5)
+            # Remember this giveaway up front so we never re-click the same box,
+            # whether or not the steps below fully succeed.
+            signature = giveaway.get("signature")
+            if signature:
+                self.entered_giveaways.add(signature)
 
-            # Try to click
-            try:
-                element.click()
-            except ElementClickInterceptedException:
-                # Try JavaScript click
-                self.driver.execute_script("arguments[0].click();", element)
-
-            self.log("Clicked giveaway entry button")
+            # Step 1: open the giveaway box.
+            if not self._click_element(box):
+                self.log("Could not click the giveaway box")
+                return False
+            self.log("Clicked the giveaway box")
             time.sleep(1)
 
-            # Check for confirmation or additional steps
+            # Step 2: find and click the actual "Enter Giveaway" button that
+            # appears in the opened panel.
+            enter_button = self._find_enter_giveaway_button()
+            if enter_button:
+                if not self._click_element(enter_button):
+                    self.log("Found the Enter Giveaway button but could not click it")
+                    return False
+                self.log("Clicked the Enter Giveaway button")
+                time.sleep(1)
+            else:
+                # Some giveaways enter directly from the box (no second panel).
+                self.log("No separate Enter Giveaway button found; the box click may have entered directly")
+
+            # Handle any extra confirmation dialog.
             self._handle_giveaway_confirmation()
 
             return True
@@ -748,6 +823,70 @@ class WhatnotBot:
         except Exception as e:
             self.log(f"Error entering giveaway: {str(e)}")
             return False
+
+    def _find_enter_giveaway_button(self, timeout: int = 5):
+        """Find the "Enter Giveaway" button after the giveaway box is opened.
+
+        Polls for a short while because the panel is rendered asynchronously.
+        """
+        lower = "translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+        # The exact labels Whatnot uses, mirroring the strings the Android
+        # client matches on in whatnot-android/ (GiveawayAccessibilityService):
+        # "Enter Giveaway", "Follow and Enter", "Enter". Whatnot renders these
+        # as <button> or as role="button" containers, so match both.
+        enter_labels = ["enter giveaway", "follow and enter", "join giveaway"]
+        enter_selectors = []
+        for label in enter_labels:
+            enter_selectors.append(f"//button[contains({lower}, '{label}')]")
+            enter_selectors.append(f"//*[@role='button'][contains({lower}, '{label}')]")
+        enter_selectors += [
+            # Fall back to a bare Enter/Join inside the opened giveaway panel.
+            f"//*[@role='dialog']//button[contains({lower}, 'enter')]",
+            f"//*[@role='dialog']//button[contains({lower}, 'join')]",
+            f"//button[normalize-space({lower})='enter']",
+            f"//button[normalize-space({lower})='join']",
+        ]
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for xpath in enter_selectors:
+                try:
+                    for btn in self.driver.find_elements(By.XPATH, xpath):
+                        try:
+                            if (btn.is_displayed() and btn.is_enabled()
+                                    and not self._is_giveaway_entered(btn)):
+                                return btn
+                        except StaleElementReferenceException:
+                            continue
+                except Exception:
+                    continue
+            time.sleep(0.5)
+
+        return None
+
+    def _click_element(self, element) -> bool:
+        """Scroll to and click an element, tolerating stale/intercepted clicks."""
+        for _ in range(2):
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", element
+                )
+                time.sleep(0.3)
+                try:
+                    element.click()
+                except (ElementClickInterceptedException, StaleElementReferenceException):
+                    # Fall back to a JavaScript click (handles overlays and
+                    # elements that just re-rendered).
+                    self.driver.execute_script("arguments[0].click();", element)
+                return True
+            except StaleElementReferenceException:
+                # Element went stale between scroll and click; retry once.
+                time.sleep(0.3)
+                continue
+            except Exception as e:
+                self.log(f"Click failed: {str(e)}")
+                return False
+        return False
 
     def _handle_giveaway_confirmation(self):
         """Handle any confirmation dialogs or additional entry steps."""
